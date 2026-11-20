@@ -1,0 +1,26 @@
+# CreatorCrew RAG — core dependencies (100% free / open source)
+# Version ranges are pinned to major lines that are known to work together
+# (LangChain 0.3 / LangGraph 0.x / Pydantic v2). Python 3.11 or 3.12.
+# TIP (much smaller download): install CPU-only PyTorch FIRST with
+#   pip install torch --index-url https://download.pytorch.org/whl/cpu
+# sentence-transformers below will then reuse it instead of the CUDA build.
+streamlit>=1.40,<1.52
+langchain>=0.3.20,<0.4
+langchain-core>=0.3,<0.4
+langchain-community>=0.3,<0.4
+langchain-chroma>=0.1,<1.0
+langchain-text-splitters>=0.3,<0.4
+langchain-huggingface>=0.1,<0.3
+langchain-google-genai>=2.0,<3.0
+langgraph>=0.4,<0.7
+chromadb>=0.5,<1.1
+sentence-transformers>=3.0,<4.0
+pydantic>=2.9,<3.0
+python-dotenv>=1.0,<2.0
+yt-dlp>=2025.1.1
+youtube-transcript-api>=1.0,<2.0
+faster-whisper>=1.1,<2.0
+av>=12,<16  # PyAV compat: faster-whisper needs metadata_errors support (removed in av 19)
+trafilatura>=2.0,<3.0
+pypdf>=5.0,<6.0
+pytest>=8.0,<9.0
