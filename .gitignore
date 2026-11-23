@@ -9,3 +9,5 @@ storage/*.db
 storage/*.log
 .pytest_cache/
 .DS_Store
+data/library/
+outputs/shorts/_work/

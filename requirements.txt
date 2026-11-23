@@ -20,6 +20,7 @@ python-dotenv>=1.0,<2.0
 yt-dlp>=2025.1.1
 youtube-transcript-api>=1.0,<2.0
 faster-whisper>=1.1,<2.0
+opencv-python-headless>=4.8,<5.0  # face-track smart reframing (YuNet/Haar)
 av>=12,<16  # PyAV compat: faster-whisper needs metadata_errors support (removed in av 19)
 trafilatura>=2.0,<3.0
 pypdf>=5.0,<6.0

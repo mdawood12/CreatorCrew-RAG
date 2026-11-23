@@ -75,6 +75,15 @@ TEMP_SCRIPT = 0.7                 # creative writing
 TEMP_CRITIC = 0.2                 # strict auditing
 MAX_UPLOAD_MB = 500
 
+# Local Whisper model for transcription (splitter/captions path):
+# "base" (High Accuracy) is the default — the 2026-11-23 real-world
+# verification found tiny mis-hearing key vocabulary ("microplastics"
+# -> "microblastics") while base cost only ~3.6 s more on a 6.5 min
+# programme. "tiny" (Ultra-Fast) remains selectable. Override with
+# the WHISPER_MODEL env var; the Splitter tab's selector sets this
+# at runtime.
+WHISPER_MODEL = os.getenv("WHISPER_MODEL", "base")
+
 # Official policy sources ingested by ingest.py (real documents, no Kaggle
 # login needed — correction C6). Failure to fetch one is a warning, not fatal.
 POLICY_URLS = [
@@ -133,11 +142,29 @@ class KeyManager:
         "4. Restart the app"
     )
 
+    # Obvious placeholder values that must never be treated as real
+    # keys (the Streamlit Secrets incident: the template text "apni-key"
+    # was pasted verbatim and the app reported a healthy key for hours).
+    # Real Gemini keys are opaque tokens — they never contain readable
+    # placeholder words — so a general marker filter is safe.
+    _PLACEHOLDER_MARKERS = (
+        "your", "placeholder", "example", "change-me", "changeme",
+        "insert", "replace", "todo", "xxxx", "apni", "dummy", "fake",
+        "sample", "enter-key", "paste", "here", "api-key", "apikey",
+    )
+
+    @staticmethod
+    def _is_placeholder(key: str) -> bool:
+        k = key.strip().strip('"').strip("'").lower()
+        if len(k) < 8:
+            return True
+        return any(m in k for m in KeyManager._PLACEHOLDER_MARKERS)
+
     def __init__(self, keys: list[str] | None = None):
         if keys is None:
             raw = os.getenv("GOOGLE_API_KEYS", "") or os.getenv("GOOGLE_API_KEY", "")
             keys = [k.strip() for k in raw.split(",")
-                    if k.strip() and "your-key" not in k]
+                    if k.strip() and not self._is_placeholder(k)]
         self.keys = keys
         self.active = 0
         self.dead: set[int] = set()

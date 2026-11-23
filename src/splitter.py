@@ -25,28 +25,17 @@ from .schemas import ClipCandidate
 
 ALLOWED_RIGHTS = {"own", "licensed", "public-domain", "creative-commons"}
 FONT = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
-HOOK_WORDS = ("how", "why", "secret", "never", "stop", "truth", "mistake",
-              "first", "finally", "suddenly", "believe", "watch", "free")
-
-
-def _score_segment(seg: dict, avg_len: float) -> float:
-    text = seg.get("text", "").lower()
-    score = 0.0
-    score += sum(1.5 for w in HOOK_WORDS if w in text)
-    score += 1.0 if "?" in text else 0.0
-    score += 1.0 if "!" in text else 0.0
-    words = len(text.split())
-    score += min(words / max(avg_len, 1), 2.0)      # denser speech = energy
-    return score
 
 
 def propose_candidates(segments: list[dict], clip_len: int = 30,
                        max_clips: int = 3) -> list[ClipCandidate]:
-    """Group transcript segments into ~clip_len windows and rank them."""
+    """Group transcript segments into ~clip_len windows, then rank
+    them with the 7-dimension virality scorer (src/editing/scoring.py,
+    Phase 5): best first, near-duplicates (>35% overlap) dropped."""
     if not segments:
         return []
-    avg_len = sum(len(s.get("text", "").split()) for s in segments) / len(segments)
-    windows: list[ClipCandidate] = []
+    from .editing import scoring
+    windows: list[dict] = []
     i = 0
     while i < len(segments):
         start = segments[i]["start"]
@@ -57,15 +46,17 @@ def propose_candidates(segments: list[dict], clip_len: int = 30,
         group = segments[i:max(j, i + 1)]
         end = group[-1]["start"] + group[-1].get("duration", 3)
         text = " ".join(s.get("text", "") for s in group)
-        score = sum(_score_segment(s, avg_len) for s in group)
-        windows.append((score, ClipCandidate(
-            start_sec=round(start, 2), end_sec=round(end, 2),
-            hook=text.strip()[:90],
-            reason=f"Heuristic score {score:.1f}: hook words, punctuation "
-                   f"and speech density in this window")))
+        windows.append({"start_sec": round(start, 2),
+                        "end_sec": round(end, 2),
+                        "hook": text.strip()[:90]})
         i = max(j, i + 1)
-    windows.sort(key=lambda w: -w[0])
-    return [w[1] for w in windows[:max_clips]]
+    ranked = scoring.rank_candidates(windows, segments,
+                                     max_clips=max_clips)
+    return [ClipCandidate(
+        start_sec=r["start_sec"], end_sec=r["end_sec"], hook=r["hook"],
+        reason=f"Virality potential (heuristic) {r['score']:.0f}/100 "
+               f"— {r['rationale']}")
+        for r in ranked]
 
 
 def _download(url: str, dest: Path) -> Path:
@@ -84,43 +75,19 @@ def _esc(text: str) -> str:
 
 def render_clip(source: Path, clip: ClipCandidate, out_path: Path,
                 reframe: str = "blur") -> Path:
-    dur = clip.duration
-    if reframe == "crop":
-        vf = "scale=-2:1920,crop=1080:1920,setsar=1"
-    else:
-        vf = ("split[a][b];"
-              "[a]scale=1080:1920:force_original_aspect_ratio=increase,"
-              "crop=1080:1920,gblur=sigma=40[bg];"
-              "[b]scale=1080:-2[fg];"
-              "[bg][fg]overlay=(W-w)/2:(H-h)/2,setsar=1")
-    vf += ",eq=contrast=1.05:saturation=1.12:brightness=0.01,unsharp=5:5:0.6"
-    if clip.hook:
-        # Word-wrap the hook to at most 2 lines of ~30 chars so long hooks
-        # never run off the 1080px-wide frame.
-        words, lines = clip.hook.split(), []
-        for w in words:
-            if lines and len(lines[-1]) + len(w) + 1 <= 30:
-                lines[-1] += " " + w
-            elif len(lines) < 2:
-                lines.append(w)
-            else:
-                lines[-1] = lines[-1].rstrip("…") + "…"
-                break
-        for i, line in enumerate(lines[:2]):
-            vf += (f",drawtext=fontfile={FONT}:text='{_esc(line)}':"
-                   "fontsize=42:fontcolor=white:borderw=3:bordercolor=black:"
-                   f"x=(w-text_w)/2:y={70 + i * 58}:box=1:"
-                   "boxcolor=black@0.45:boxborderw=12")
-    vf += f",drawbox=x=0:y=ih-12:w='iw*t/{dur:.2f}':h=12:color=red@0.9:t=fill"
-    cmd = ["ffmpeg", "-y", "-ss", str(clip.start_sec), "-t", str(dur),
-           "-i", str(source), "-vf", vf,
-           "-af", "loudnorm=I=-14:TP=-1:LRA=11",
-           "-c:v", "libx264", "-preset", "medium", "-crf", "19",
-           "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart",
-           str(out_path)]
-    r = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
-    if r.returncode != 0:
-        raise RuntimeError("FFmpeg render failed: " + r.stderr[-800:])
+    """Render one clip. Delegates to the modular editing pipeline
+    (src/editing/) with the Minimal preset, which reproduces this
+    splitter's original look exactly: blur/crop 9:16 reframe, the
+    classic grade, hook overlay + progress bar, loudnorm -14 LUFS."""
+    from .editing import pipeline, presets
+    cfg = presets.build_config("Minimal")
+    cfg["reframe"]["params"]["mode"] = reframe
+    work = config.SHORTS_DIR / "_work" / f"pipe-{out_path.stem}"
+    result = pipeline.render_segment(
+        source, clip.start_sec, clip.end_sec, cfg, out_path, work,
+        extras={"hook_text": clip.hook})
+    for w in result["warnings"]:
+        logger.warning("Splitter render: %s", w)
     return out_path
 
 
@@ -153,14 +120,24 @@ def split_video(source: str, rights: str, source_note: str,
     candidates = propose_candidates(tr["segments"], clip_len, max_clips)
     logger.info("Splitter: %d candidates from %s (transcript via %s)",
                 len(candidates), source, tr["method"])
+    from .editing import scoring as _scoring
+    _ranked = _scoring.rank_candidates(
+        [{"start_sec": c.start_sec, "end_sec": c.end_sec, "hook": c.hook}
+         for c in candidates], tr["segments"])
+    _score_by_span = {(r["start_sec"], r["end_sec"]): r for r in _ranked}
 
     results = []
     for idx, clip in enumerate(candidates, 1):
         out = config.SHORTS_DIR / f"clip-{idx:02d}.mp4"
         render_clip(local, clip, out, reframe=reframe)
+        _sc = _score_by_span.get((clip.start_sec, clip.end_sec), {})
         meta = {**clip.model_dump(), "rights": rights,
                 "source_note": source_note, "source": source,
-                "transcript_method": tr["method"], "file": out.name}
+                "transcript_method": tr["method"], "file": out.name,
+                "word_timings": tools.word_timings_label(tr["segments"]),
+                "virality_score": _sc.get("score"),
+                "score_breakdown": _sc.get("breakdown"),
+                "score_rationale": _sc.get("rationale")}
         (config.SHORTS_DIR / f"clip-{idx:02d}.json").write_text(
             json.dumps(meta, indent=2), encoding="utf-8")
         memory.save_output("clip", source, "shorts",

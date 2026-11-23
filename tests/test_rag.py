@@ -18,7 +18,7 @@ from src.schemas import ClipCandidate, ScriptPackage
 def test_config_validates():
     report = config.validate()
     assert report["ffmpeg"] != "NOT FOUND", "FFmpeg must be installed"
-    assert report["model"] == "gemini-2.5-flash"
+    assert report["model"] == config.LLM_MODEL
 
 
 def test_key_manager_failover():

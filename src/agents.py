@@ -134,9 +134,19 @@ def critic_node(state: StudioState) -> StudioState:
             rep = structured.invoke(prompt)
             return rep.model_dump()
         except Exception as e:
-            logger.warning("Critic structured output failed (%s)", e)
-            return {"compliance_ok": True, "originality_overlap_pct": overlap,
-                    "groundedness": 0.7, "issues": [], "verdict": "pass"}
+            # Fail CLOSED on compliance [Phase 0]: an unparseable Critic
+            # audit must never silently approve a package. The package is
+            # marked "needs review" (compliance_ok False, verdict revise)
+            # and a human decides — the old fallback passed everything.
+            logger.warning("Critic structured output failed (%s) — "
+                           "failing CLOSED (needs review)", e)
+            return {"compliance_ok": False,
+                    "originality_overlap_pct": overlap,
+                    "groundedness": 0.0,
+                    "issues": ["NEEDS REVIEW: the Critic could not produce "
+                               "a structured audit, so this package was "
+                               "NOT approved automatically."],
+                    "verdict": "revise"}
 
     report = config.call_llm_with_failover(_call)
     report["originality_overlap_pct"] = max(
