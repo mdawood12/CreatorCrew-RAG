@@ -274,11 +274,15 @@ with tab_split:
 
     st.subheader("Step 2 — Choose your video")
     src_mode = st.radio("Video source",
-                        ["Upload a file", "Direct media URL", "Media library"],
+                        ["Upload a file", "Direct media URL",
+                         "My video URL (YouTube etc.)", "Media library"],
                         horizontal=True,
                         help="Uploads and direct media-file URLs are "
-                             "validated and stored in your media library. "
-                             "Watch-page URLs are not accepted.")
+                             "validated and stored in your media "
+                             "library. 'My video URL' fetches one of "
+                             "YOUR OWN videos from a watch page (e.g. "
+                             "your YouTube channel) under the same "
+                             "rights declaration.")
     pending = None          # (kind, value) waiting to be added to library
     if src_mode == "Upload a file":
         uploaded = st.file_uploader("Video file (MP4, MOV, MKV, WebM)",
@@ -294,6 +298,22 @@ with tab_split:
                  "licensed to use.", key="sp_url")
         if src_url.strip():
             pending = ("url", src_url.strip())
+    elif src_mode == "My video URL (YouTube etc.)":
+        watch_url = st.text_input(
+            "Your video's watch-page URL",
+            placeholder="https://www.youtube.com/watch?v=…",
+            help="For YOUR OWN videos only — the rights declaration "
+                 "above applies and is saved with every clip. The "
+                 "video is fetched at up to 720p to save space.",
+            key="sp_watch_url")
+        st.checkbox(
+            "Delete the downloaded video after rendering (save space)",
+            value=True, key="sp_autodel",
+            help="The downloaded long video is removed once your "
+                 "clips are rendered — only the clips stay on disk. "
+                 "The rights record is kept in each clip's JSON.")
+        if watch_url.strip():
+            pending = ("watch", watch_url.strip())
     else:
         items = _intake.list_library()
         if not items:
@@ -325,6 +345,11 @@ with tab_split:
                         tmp.write_bytes(f.getbuffer())
                         entry = _intake.add_to_library(
                             str(tmp), rights, source_note)
+                    elif pending[0] == "watch":
+                        entry = _intake.add_watch_url_to_library(
+                            pending[1], rights, source_note)
+                        st.session_state["sp_autodelete"] = bool(
+                            st.session_state.get("sp_autodel", True))
                     else:
                         entry = _intake.add_to_library(
                             pending[1], rights, source_note)
@@ -335,6 +360,15 @@ with tab_split:
                 friendly_error(e)
 
     sp_source = st.session_state.get("sp_source")
+    if sp_source and not Path(sp_source["path"]).exists():
+        # e.g. a URL-fetched source that was auto-deleted after a
+        # render to save disk space.
+        st.session_state.pop("sp_source", None)
+        st.info("The previously selected video's file is no longer "
+                "on disk (URL-fetched sources are deleted after "
+                "rendering when the save-space option is on). "
+                "Please choose a video again.")
+        sp_source = None
     if sp_source:
         st.caption(f"🎬 Selected: **{sp_source['name']}** · "
                    f"{sp_source['duration']:.0f}s · "
@@ -565,6 +599,13 @@ with tab_split:
                 status.empty()
                 st.session_state["sp_results"] = results
                 st.success(f"{len(results)} clip(s) rendered:")
+                if (sp_source.get("origin_kind") == "watch-url"
+                        and st.session_state.get("sp_autodelete", True)
+                        and _intake.remove_from_library(sp_source["id"])):
+                    st.info("🗑️ Save-space: the downloaded long video "
+                            "was deleted — only your clips remain on "
+                            "disk. The rights record is kept in each "
+                            "clip's JSON file.")
             except Exception as e:
                 friendly_error(e)
 
