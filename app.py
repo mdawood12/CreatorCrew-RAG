@@ -31,6 +31,7 @@ except Exception:
 
 from src import config, memory
 from src.config import KEY_MANAGER
+from video_settings import render_clip_settings
 
 st.set_page_config(page_title="CreatorCrew RAG", page_icon="🎬",
                    layout="wide")
@@ -376,12 +377,9 @@ with tab_split:
                    f"rights: {sp_source['rights']}")
 
     st.subheader("Step 3 — Find scenes & adjust timestamps")
-    clip_len = st.radio("Target clip length", [10, 15, 20, 30],
-                        index=1, horizontal=True,
-                        format_func=lambda s: f"~{s} seconds",
-                        key="sp_len",
-                        help="Quick-select the short format you want — "
-                             "~15s is the sweet spot for Shorts/Reels.")
+    clip_settings = render_clip_settings(key_prefix="sp")
+    clip_len = clip_settings["duration_seconds"]
+    num_clips = clip_settings["clip_count"]
     whisper_model = st.radio(
         "Speech engine", ["tiny", "base"], index=1, horizontal=True,
         format_func=lambda m: ("⚡ Ultra-Fast (Tiny — 5x speed)"
@@ -391,7 +389,7 @@ with tab_split:
         help="Base is the default — it hears difficult words more "
              "accurately; Tiny transcribes much faster on CPU.")
     config.WHISPER_MODEL = whisper_model
-    if st.button("🔍 Detect scenes"):
+    if st.button("🔍 Detect scenes", type="primary"):
         if not sp_source:
             st.warning("Choose a video in Step 2 first.")
         else:
@@ -407,7 +405,8 @@ with tab_split:
                         raise RuntimeError(
                             "No transcript/timestamps could be produced "
                             "for this video, so scenes cannot be detected.")
-                    cands = propose_candidates(tr["segments"], clip_len, 3)
+                    cands = propose_candidates(tr["segments"], clip_len,
+                                               num_clips)
                     ranked = _scoring.rank_candidates(
                         [{"start_sec": c.start_sec, "end_sec": c.end_sec,
                           "hook": c.hook} for c in cands], tr["segments"])
@@ -667,6 +666,8 @@ with tab_split:
                         platform_format=plan_platform, niche=plan_niche,
                         creator_angle=plan_angle, rights=rights,
                         source_note=source_note)
+                    plan["target_duration_seconds"] = clip_len
+                    plan["scene_count"] = num_clips
                 st.success("Transformation plan ready:")
                 st.info(f"⚠️ {plan['risk_note']}")
                 for step in plan["steps"]:
