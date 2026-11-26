@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import subprocess
 from pathlib import Path
+from urllib.parse import urlparse
 
 from . import config, memory, tools
 from .config import logger
@@ -60,6 +61,20 @@ def propose_candidates(segments: list[dict], clip_len: int = 30,
 
 
 def _download(url: str, dest: Path) -> Path:
+    # Same URL policy as the editing intake (docs/AUDIT.md Finding 1):
+    # watch-page hosts are refused here too, before yt-dlp runs. The
+    # host list lives ONLY in src/editing/intake.py — imported lazily,
+    # like .editing.scoring above, to avoid an import cycle (intake
+    # imports ALLOWED_RIGHTS from this module).
+    from .editing.intake import _WATCH_HOSTS
+    host = urlparse(url).netloc.lower().split(":")[0]
+    if any(host == h or host.endswith("." + h) for h in _WATCH_HOSTS):
+        raise ValueError(
+            "Watch-page URLs are not accepted here. For your own "
+            "YouTube or similar videos, use the Viral Splitter's "
+            "'My video URL (YouTube etc.)' source instead; otherwise "
+            "use a direct link to a media file you own or are "
+            "licensed to use.")
     subprocess.run(["yt-dlp", "-f", "bv*+ba/b", "-o", str(dest), url],
                    capture_output=True, timeout=1800, check=True)
     files = [p for p in dest.parent.glob(dest.stem + ".*")]
