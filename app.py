@@ -1,5 +1,5 @@
 """
-app.py — CreatorCrew RAG Streamlit dashboard.
+app.py — DawoodAIStudio Streamlit dashboard.
 
 Architect rules applied (master prompt v2, Section 7):
 - Home dashboard first: stat cards + 3 big actions; a new user
@@ -33,7 +33,15 @@ from src import config, memory
 from src.config import KEY_MANAGER
 from video_settings import render_clip_settings
 
-st.set_page_config(page_title="CreatorCrew RAG", page_icon="🎬",
+LOGO_PATH = Path(__file__).parent / "assets" / "logo.png"
+try:
+    from PIL import Image
+    _page_icon = Image.open(LOGO_PATH)
+    _page_icon.load()
+except Exception:
+    _page_icon = "🎬"
+
+st.set_page_config(page_title="DawoodAIStudio", page_icon=_page_icon,
                    layout="wide")
 
 DEMO_SCRIPT = {
@@ -157,6 +165,8 @@ def _render_pack(pack, template_name, topic_text, key_prefix):
 # ---------------------------------------------------------------------------
 profile = memory.get_profile()
 with st.sidebar:
+    if LOGO_PATH.exists():
+        st.sidebar.image(str(LOGO_PATH), width=140)
     st.header("🎛️ Creator Settings")
     niche = st.text_input("Niche", profile.get("niche", ""),
                           help="What is your channel/page about?")
@@ -198,7 +208,10 @@ with st.sidebar:
 # Home dashboard — stat cards + big actions
 # ---------------------------------------------------------------------------
 ensure_kb()
-st.title("🎬 CreatorCrew RAG")
+if LOGO_PATH.exists():
+    st.image(str(LOGO_PATH), width=110)
+st.title("DawoodAIStudio")
+st.caption("Content Automation Studio")
 st.caption("Free multi-agent content & video automation studio for YouTube and Facebook.")
 stats = memory.stats()
 c1, c2, c3, c4 = st.columns(4)
