@@ -1,9 +1,13 @@
 """
 memory.py — Long-term memory in SQLite [Phase 3, schema C9].
 
-Two tables:
+Tables:
 - creator_profile(key, value): niche, audience, tone, channel name.
 - outputs(...): every generated package + critic report (History tab).
+- master_templates(name, data, updated_at): locked Master Prompt
+  templates, stored as validated JSON.
+- master_topics(...): topics saved under exactly one template each,
+  with a status and (later) their generation result.
 
 Short-term/session memory is separate: LangGraph's MemorySaver in
 agents.py. This module is deliberately dependency-light (stdlib sqlite3)
@@ -35,6 +39,13 @@ def init_db() -> None:
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             created_at TEXT, kind TEXT, topic TEXT, platform TEXT,
             content_json TEXT, critic_json TEXT)""")
+        c.execute("""CREATE TABLE IF NOT EXISTS master_templates(
+            name TEXT PRIMARY KEY, data TEXT NOT NULL, updated_at TEXT)""")
+        c.execute("""CREATE TABLE IF NOT EXISTS master_topics(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            template_name TEXT NOT NULL, topic TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'new', result TEXT,
+            created_at TEXT, updated_at TEXT)""")
 
 
 def get_profile() -> dict:
@@ -82,6 +93,146 @@ def list_outputs(limit: int = 20) -> list[dict]:
         d["critic"] = json.loads(d.pop("critic_json") or "{}")
         out.append(d)
     return out
+
+
+def save_template(data: dict) -> dict:
+    """Upsert a Master Prompt template by name; returns the stored dict."""
+    init_db()
+    stored = dict(data)
+    stored["name"] = str(stored.get("name", "")).strip()
+    with _conn() as c:
+        c.execute(
+            "INSERT INTO master_templates(name, data, updated_at) "
+            "VALUES(?,?,?) ON CONFLICT(name) DO UPDATE SET "
+            "data=excluded.data, updated_at=excluded.updated_at",
+            (stored["name"], json.dumps(stored, ensure_ascii=False),
+             datetime.now(timezone.utc).isoformat()))
+    return get_template(stored["name"])
+
+
+def get_template(name: str) -> dict | None:
+    init_db()
+    with _conn() as c:
+        row = c.execute("SELECT data FROM master_templates WHERE name=?",
+                        (name,)).fetchone()
+    return json.loads(row["data"]) if row else None
+
+
+def list_template_names() -> list[str]:
+    init_db()
+    with _conn() as c:
+        rows = c.execute("SELECT name FROM master_templates "
+                         "ORDER BY name").fetchall()
+    return [r["name"] for r in rows]
+
+
+def delete_template(name: str) -> bool:
+    init_db()
+    with _conn() as c:
+        cur = c.execute("DELETE FROM master_templates WHERE name=?",
+                        (name,))
+        return cur.rowcount > 0
+
+
+TOPIC_STATUSES = ("new", "generated", "posted")
+
+
+def _topic_row(row) -> dict:
+    """sqlite row -> topic dict with `result` parsed back to dict|None."""
+    d = dict(row)
+    d["result"] = json.loads(d["result"]) if d.get("result") else None
+    return d
+
+
+def add_topic(template_name: str, topic: str) -> dict:
+    """Insert a topic under one template with status 'new'."""
+    init_db()
+    now = datetime.now(timezone.utc).isoformat()
+    with _conn() as c:
+        cur = c.execute(
+            "INSERT INTO master_topics(template_name, topic, status, "
+            "result, created_at, updated_at) VALUES(?,?,?,NULL,?,?)",
+            (template_name, topic, "new", now, now))
+        topic_id = int(cur.lastrowid)
+    return get_topic(topic_id)
+
+
+def list_topics(template_name: str) -> list[dict]:
+    """All topics of ONE template, latest first — never mixed."""
+    init_db()
+    with _conn() as c:
+        rows = c.execute(
+            "SELECT * FROM master_topics WHERE template_name=? "
+            "ORDER BY id DESC", (template_name,)).fetchall()
+    return [_topic_row(r) for r in rows]
+
+
+def get_topic(topic_id: int) -> dict | None:
+    init_db()
+    with _conn() as c:
+        row = c.execute("SELECT * FROM master_topics WHERE id=?",
+                        (topic_id,)).fetchone()
+    return _topic_row(row) if row else None
+
+
+def find_topic(template_name: str, topic: str) -> dict | None:
+    """Case-insensitive lookup of a topic within one template only."""
+    init_db()
+    with _conn() as c:
+        row = c.execute(
+            "SELECT * FROM master_topics WHERE template_name=? "
+            "AND LOWER(TRIM(topic))=? ORDER BY id DESC LIMIT 1",
+            (template_name, (topic or "").strip().lower())).fetchone()
+    return _topic_row(row) if row else None
+
+
+def set_topic_status(topic_id: int, status: str) -> bool:
+    if status not in TOPIC_STATUSES:
+        raise ValueError(f"Invalid topic status {status!r} — "
+                         f"must be one of {TOPIC_STATUSES}")
+    init_db()
+    with _conn() as c:
+        cur = c.execute(
+            "UPDATE master_topics SET status=?, updated_at=? WHERE id=?",
+            (status, datetime.now(timezone.utc).isoformat(), topic_id))
+        return cur.rowcount > 0
+
+
+def save_topic_result(topic_id: int, result: dict) -> bool:
+    """Store a generation result on a topic; flips status to 'generated'."""
+    init_db()
+    with _conn() as c:
+        cur = c.execute(
+            "UPDATE master_topics SET result=?, status='generated', "
+            "updated_at=? WHERE id=?",
+            (json.dumps(result, ensure_ascii=False),
+             datetime.now(timezone.utc).isoformat(), topic_id))
+        return cur.rowcount > 0
+
+
+def delete_topic(topic_id: int) -> bool:
+    init_db()
+    with _conn() as c:
+        cur = c.execute("DELETE FROM master_topics WHERE id=?",
+                        (topic_id,))
+        return cur.rowcount > 0
+
+
+def count_topics(template_name: str) -> int:
+    init_db()
+    with _conn() as c:
+        return c.execute(
+            "SELECT COUNT(*) n FROM master_topics WHERE template_name=?",
+            (template_name,)).fetchone()["n"]
+
+
+def delete_topics_for_template(template_name: str) -> int:
+    """Remove every topic of a template; returns rows removed."""
+    init_db()
+    with _conn() as c:
+        cur = c.execute("DELETE FROM master_topics WHERE template_name=?",
+                        (template_name,))
+        return cur.rowcount
 
 
 def stats() -> dict:

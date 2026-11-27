@@ -167,9 +167,10 @@ c2.metric("✍️ Scripts generated", stats["scripts"])
 c3.metric("🎞️ Clips rendered", stats["clips"])
 c4.metric("🔑 API key", key_status_label[:28])
 
-tab_home, tab_studio, tab_transform, tab_split, tab_eval = st.tabs(
-    ["🏠 Home", "✍️ Content Studio", "🔗 Link Transformer",
-     "✂️ Viral Splitter", "📊 Evaluation & History"])
+tab_home, tab_studio, tab_transform, tab_split, tab_eval, tab_master = \
+    st.tabs(["🏠 Home", "✍️ Content Studio", "🔗 Link Transformer",
+             "✂️ Viral Splitter", "📊 Evaluation & History",
+             "🎬 Master Prompt"])
 
 with tab_home:
     st.subheader("What do you want to do?")
@@ -239,12 +240,31 @@ with tab_transform:
             try:
                 from src.transformer import transform_link
                 res = transform_link(url)
-                st.success(f"Original script ready — overlap with source: "
-                           f"{res.overlap_pct}% (limit 25%)")
+                if res.needs_review:
+                    st.warning(f"Script ready, but it is still too close "
+                               f"to the source — overlap: "
+                               f"{res.overlap_pct}% (limit 25%). "
+                               f"Review it by hand before use.")
+                else:
+                    st.success(f"Original script ready — overlap with "
+                               f"source: {res.overlap_pct}% (limit 25%)")
                 st.markdown(f"**Fresh angle:** {res.angle}")
                 st.markdown("**Core ideas used:**")
                 for idea in res.source_ideas:
                     st.markdown(f"- {idea}")
+                if res.beats:
+                    st.markdown("**Scene beats — production prompts:**")
+                    for i, beat in enumerate(res.beats, start=1):
+                        start = int(beat.start_sec)
+                        st.markdown(f"**Beat {i} · "
+                                    f"{start // 60}:{start % 60:02d}**")
+                        st.markdown(beat.narration)
+                        st.code(beat.visual_prompt)
+                        if beat.on_screen_text:
+                            st.markdown("On-screen text: "
+                                        f"{beat.on_screen_text}")
+                if res.cta:
+                    st.markdown(f"**CTA:** {res.cta}")
                 st.text_area("Your original script", res.original_script,
                              height=300)
                 st.download_button("⬇️ Download script (.txt)",
@@ -718,3 +738,221 @@ with tab_eval:
             st.json(r["content"])
             if r["critic"]:
                 st.caption(f"Critic: {json.dumps(r['critic'])[:400]}")
+
+# ---------------------------------------------------------------------------
+# Tab 5 — Master Prompt (lock a template once; Step 2 generates by topic)
+# ---------------------------------------------------------------------------
+with tab_master:
+    from src import master_prompt
+    from src.schemas import MasterPromptTemplate
+
+    st.subheader("Master Prompt — lock your production template")
+    st.caption("Set everything once — characters, style, structure and "
+               "posting defaults. After locking, the next step generates "
+               "a full video package from just a topic name.")
+
+    _notice = st.session_state.pop("mp_notice", None)
+    if _notice:
+        st.success(_notice)
+
+    NEW_TEMPLATE = "➕ New template"
+    MP_FORMATS = ["Shorts 30s", "Reel 60s", "YouTube 3–5 min"]
+    MP_LANGUAGES = ["English", "Urdu", "Roman Urdu"]
+    template_names = master_prompt.list_names()
+    if template_names:
+        for _tname in template_names:
+            st.markdown(f"**{_tname}** — "
+                        f"{master_prompt.count_topics(_tname)} topics")
+        st.divider()
+    choice = st.selectbox("Template", [NEW_TEMPLATE] + template_names,
+                          key="mp_choice")
+
+    # When the selection changes, load that template's saved values
+    # into the form fields (blank defaults for a new template).
+    if st.session_state.get("mp_loaded_for") != choice:
+        loaded_tpl = (master_prompt.load(choice)
+                      if choice != NEW_TEMPLATE else None)
+        vals = loaded_tpl or MasterPromptTemplate(name="")
+        st.session_state["mp_name"] = vals.name
+        st.session_state["mp_characters"] = master_prompt.format_characters(
+            [c.model_dump() for c in vals.characters])
+        st.session_state["mp_visual_style"] = vals.visual_style
+        st.session_state["mp_negative"] = vals.negative_prompt
+        st.session_state["mp_format"] = (
+            vals.target_format if vals.target_format in MP_FORMATS
+            else "Reel 60s")
+        st.session_state["mp_beats"] = int(vals.beat_count)
+        st.session_state["mp_hook"] = vals.hook_style
+        st.session_state["mp_cta"] = vals.cta
+        st.session_state["mp_language"] = (
+            vals.language if vals.language in MP_LANGUAGES else "English")
+        st.session_state["mp_tone"] = vals.tone
+        st.session_state["mp_caption"] = vals.caption_style
+        st.session_state["mp_hashtags"] = vals.hashtags
+        st.session_state["mp_loaded_for"] = choice
+
+    tpl_name = st.text_input("Template name", key="mp_name",
+                             placeholder="e.g. Paws & Plates — Restaurant Cats")
+    tpl_characters = st.text_area(
+        "Characters", key="mp_characters", height=110,
+        help="One character per line as “Name — description”, e.g. "
+             "“Gus — fluffy orange tabby, green eyes, restaurant manager”. "
+             "These exact descriptions go into every visual prompt, so "
+             "your characters stay the same in every video.")
+    tpl_visual_style = st.text_area(
+        "Visual style", key="mp_visual_style", height=80,
+        help="The fixed look of every scene, e.g. “cinematic realistic, "
+             "warm light, cozy American diner, vertical 9:16”.")
+    tpl_negative = st.text_area(
+        "Negative prompt", key="mp_negative", height=70,
+        help="What must never appear in a generated scene.")
+    col_f, col_b = st.columns(2)
+    with col_f:
+        tpl_format = st.selectbox("Target format", MP_FORMATS,
+                                  key="mp_format")
+    with col_b:
+        tpl_beats = st.number_input("Beat count", min_value=0, max_value=30,
+                                    step=1, key="mp_beats",
+                                    help="0 = auto — the generator decides "
+                                         "from the format.")
+    tpl_hook = st.text_input("Hook style", key="mp_hook",
+                             help="How every video should open, e.g. "
+                                  "“bold question in the first 3 seconds”.")
+    tpl_cta = st.text_input("CTA line", key="mp_cta",
+                            help="The fixed closing call-to-action line.")
+    col_l, col_t = st.columns(2)
+    with col_l:
+        tpl_language = st.selectbox("Language", MP_LANGUAGES,
+                                    key="mp_language")
+    with col_t:
+        tpl_tone = st.text_input("Tone", key="mp_tone")
+    tpl_caption = st.text_area("Caption style", key="mp_caption", height=70,
+                               help="How posting captions should be written.")
+    tpl_hashtags = st.text_input("Hashtags", key="mp_hashtags",
+                                 help="The fixed hashtag set for every post.")
+
+    if st.button("🔒 Save / Lock template", type="primary"):
+        clean_name = (tpl_name or "").strip()
+        if not clean_name:
+            st.error("Give the template a name first — a locked template "
+                     "is saved and picked by its name.")
+        else:
+            master_prompt.save(MasterPromptTemplate(
+                name=clean_name,
+                characters=master_prompt.parse_characters(tpl_characters),
+                visual_style=tpl_visual_style,
+                negative_prompt=tpl_negative,
+                target_format=tpl_format,
+                beat_count=int(tpl_beats),
+                hook_style=tpl_hook,
+                cta=tpl_cta,
+                language=tpl_language,
+                tone=tpl_tone,
+                caption_style=tpl_caption,
+                hashtags=tpl_hashtags))
+            st.session_state["mp_last_saved"] = clean_name
+            st.success(f"🔒 Locked — “{clean_name}” is saved. From now on "
+                       "it can drive generation with just a topic name.")
+
+    # What's locked — always re-read from storage, so it proves the
+    # template really persisted (not just what's in the form).
+    summary_name = (choice if choice != NEW_TEMPLATE
+                    else st.session_state.get("mp_last_saved", ""))
+    saved_tpl = master_prompt.load(summary_name) if summary_name else None
+    if saved_tpl is not None:
+        st.divider()
+        st.markdown("#### 🔒 What's locked")
+        st.markdown(f"**Template:** {saved_tpl.name}")
+        char_names = ", ".join(c.name for c in saved_tpl.characters) or "—"
+        st.markdown(f"**Characters:** {char_names}")
+        st.markdown(
+            f"**Format:** {saved_tpl.target_format} · "
+            f"**Beats:** {saved_tpl.beat_count or 'Auto'} · "
+            f"**Language:** {saved_tpl.language}")
+        if saved_tpl.cta:
+            st.markdown(f"**CTA:** {saved_tpl.cta}")
+
+    if choice != NEW_TEMPLATE:
+        st.divider()
+        if st.checkbox("Delete this template", key=f"mp_del_{choice}"):
+            if st.button("🗑️ Delete", key="mp_delete_btn"):
+                master_prompt.delete(choice)
+                st.session_state["mp_notice"] = (
+                    f"Deleted template “{choice}”.")
+                st.session_state.pop("mp_loaded_for", None)
+                st.rerun()
+
+    # ------------------------------------------------------------------
+    # Topics — the selected template's own section. A topic lives under
+    # exactly one template and is never mixed with another's. Step 2
+    # generation will auto-save its result onto the topic from here.
+    # ------------------------------------------------------------------
+    if choice != NEW_TEMPLATE:
+        st.divider()
+        topic_total = master_prompt.count_topics(choice)
+        st.subheader(f"📌 Topics — {choice} ({topic_total})")
+
+        topic_query = st.text_input(
+            "Search topics", key=f"mp_topic_search_{choice}",
+            placeholder="Type to filter this template's topics…")
+        col_new, col_add = st.columns([4, 1])
+        with col_new:
+            new_topic = st.text_input(
+                "New topic", key=f"mp_topic_new_{choice}",
+                placeholder="e.g. Gus tries to cook a giant pancake")
+        with col_add:
+            st.write("")  # align the button with the input box
+            add_clicked = st.button("➕ Add topic",
+                                    key=f"mp_topic_add_{choice}")
+        if add_clicked:
+            clean_topic = (new_topic or "").strip()
+            if not clean_topic:
+                st.error("Write a topic first.")
+            elif master_prompt.topic_exists(choice, clean_topic):
+                st.warning(f"“{clean_topic}” already exists under "
+                           f"“{choice}” — topics are not duplicated.")
+            else:
+                master_prompt.add_topic(choice, clean_topic)
+                st.session_state["mp_notice"] = (
+                    f"Topic added under “{choice}”: {clean_topic}")
+                st.rerun()
+
+        TOPIC_STATUS_LABELS = {"new": "🆕 New",
+                               "generated": "✅ Generated",
+                               "posted": "📣 Posted"}
+        topics = master_prompt.list_topics(choice)
+        if topic_query:
+            _q = topic_query.strip().lower()
+            topics = [t for t in topics if _q in t.topic.lower()]
+        if not topics:
+            st.caption("No topics match your search."
+                       if topic_query else
+                       "No topics here yet — add the first one above.")
+        for t in topics:
+            _label = (f"{t.topic} · "
+                      f"{TOPIC_STATUS_LABELS.get(t.status, t.status)} · "
+                      f"{(t.created_at or '')[:10]}")
+            with st.expander(_label):
+                if t.result:
+                    st.json(t.result)
+                _cur = t.status if t.status in TOPIC_STATUS_LABELS else "new"
+                new_status = st.selectbox(
+                    "Status", list(TOPIC_STATUS_LABELS),
+                    index=list(TOPIC_STATUS_LABELS).index(_cur),
+                    format_func=lambda s: TOPIC_STATUS_LABELS[s],
+                    key=f"mp_topic_status_{t.id}")
+                if st.button("Update status",
+                             key=f"mp_topic_status_btn_{t.id}"):
+                    master_prompt.set_topic_status(t.id, new_status)
+                    st.session_state["mp_notice"] = (
+                        f"Topic “{t.topic}” is now "
+                        f"{TOPIC_STATUS_LABELS[new_status]}.")
+                    st.rerun()
+                if st.checkbox("Delete this topic",
+                               key=f"mp_topic_del_{t.id}"):
+                    if st.button("🗑️ Delete topic",
+                                 key=f"mp_topic_del_btn_{t.id}"):
+                        master_prompt.delete_topic(t.id)
+                        st.session_state["mp_notice"] = (
+                            f"Deleted topic “{t.topic}”.")
+                        st.rerun()
