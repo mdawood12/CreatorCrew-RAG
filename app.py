@@ -112,6 +112,46 @@ def friendly_error(e: Exception) -> None:
         st.error(f"Something went wrong: {msg[:300]}")
 
 
+def _render_pack(pack, template_name, topic_text, key_prefix):
+    """Render one generated production pack: title, hook, the timed
+    beats with copyable visual prompts, CTA, caption, hashtags — plus
+    the one-file markdown download. Shared by the Content Studio
+    generation surface and the Master Prompt tab's topic library."""
+    from src import generators, master_prompt
+    from src.schemas import MasterPromptTemplate
+    pack_tpl = (master_prompt.load(template_name)
+                or MasterPromptTemplate(name=template_name))
+    if pack.get("title"):
+        st.markdown(f"**{pack['title']}**")
+    if pack.get("hook"):
+        st.markdown(f"**Hook:** {pack['hook']}")
+    _total = int(float(pack.get("total_duration_sec") or 0))
+    st.caption(f"Total duration: ~{_total // 60}:{_total % 60:02d} "
+               f"({_total}s)")
+    for i, beat in enumerate(pack.get("beats") or [], start=1):
+        _start = int(float(beat.get("start_sec") or 0))
+        st.markdown(f"**Beat {i} · {_start // 60}:{_start % 60:02d}**")
+        st.markdown(beat.get("narration", ""))
+        if beat.get("visual_prompt"):
+            st.code(beat["visual_prompt"])
+        if beat.get("on_screen_text"):
+            st.markdown(f"On-screen text: {beat['on_screen_text']}")
+        if beat.get("music_cue"):
+            st.markdown(f"Music: {beat['music_cue']}")
+    if pack.get("cta"):
+        st.markdown(f"**CTA:** {pack['cta']}")
+    if pack.get("caption"):
+        st.markdown("**Caption:**")
+        st.markdown(pack["caption"])
+    if pack.get("hashtags"):
+        st.markdown(f"**Hashtags:** {pack['hashtags']}")
+    st.download_button(
+        "⬇️ Download production pack (.md)",
+        generators.format_production_pack(pack_tpl, topic_text, pack),
+        file_name="production-pack.md",
+        key=f"mp_pack_dl_{key_prefix}")
+
+
 # ---------------------------------------------------------------------------
 # Sidebar — creator settings (long-term memory) + key status [C15]
 # ---------------------------------------------------------------------------
@@ -221,6 +261,137 @@ with tab_studio:
                         "⬇️ Download script package (JSON)",
                         json.dumps(result, indent=2),
                         file_name="script-package.json")
+                except Exception as e:
+                    friendly_error(e)
+
+    # ------------------------------------------------------------------
+    # Master Prompt generation — the Zero-to-Hero work surface.
+    # 1) A complete locked master prompt from ONLY a niche name.
+    # 2) A topic's full production pack from a LOCKED master prompt.
+    # All generation lives here, in the content-creator section; the
+    # 🎬 Master Prompt tab stays the library (lock / edit / view).
+    # ------------------------------------------------------------------
+    st.divider()
+    st.subheader("🎬 Master Prompt — Zero to Hero")
+    st.caption("Pehle niche se master prompt banao, phir usi locked "
+               "template se sirf topic par poora production pack.")
+
+    from src import generators, master_prompt
+
+    st.markdown("**1 — Master prompt banao (sirf niche se)**")
+    col_sn, col_sb = st.columns([4, 1])
+    with col_sn:
+        studio_niche = st.text_input(
+            "Niche", key="studio_mp_niche",
+            placeholder="e.g. deep sea creatures / home fitness for "
+                        "beginners / classic muscle cars")
+    with col_sb:
+        st.write("")  # align the button with the input box
+        studio_gen_tpl_clicked = st.button(
+            "🎬 Generate master prompt", key="studio_mp_gen_btn")
+    if studio_gen_tpl_clicked:
+        clean_niche = (studio_niche or "").strip()
+        if not clean_niche:
+            st.error("Pehle niche ka naam likho.")
+        else:
+            try:
+                with st.spinner("Premium standard se master prompt "
+                                "tayyar ho raha hai…"):
+                    new_tpl = generators.generate_template_from_niche(
+                        clean_niche)
+                if master_prompt.load(new_tpl.name) is not None:
+                    # Name collision: load the generated values into
+                    # the Master Prompt tab's form (its widgets render
+                    # later this run, so setting the keys is safe) —
+                    # nothing is overwritten until he reviews + Locks
+                    # there.
+                    st.session_state["mp_name"] = new_tpl.name
+                    st.session_state["mp_characters"] = (
+                        master_prompt.format_characters(
+                            [c.model_dump() for c in new_tpl.characters]))
+                    st.session_state["mp_visual_style"] = (
+                        new_tpl.visual_style)
+                    st.session_state["mp_negative"] = (
+                        new_tpl.negative_prompt)
+                    st.session_state["mp_format"] = new_tpl.target_format
+                    st.session_state["mp_beats"] = int(new_tpl.beat_count)
+                    st.session_state["mp_hook"] = new_tpl.hook_style
+                    st.session_state["mp_cta"] = new_tpl.cta
+                    st.session_state["mp_language"] = new_tpl.language
+                    st.session_state["mp_tone"] = new_tpl.tone
+                    st.session_state["mp_caption"] = new_tpl.caption_style
+                    st.session_state["mp_hashtags"] = new_tpl.hashtags
+                    st.session_state["mp_loaded_for"] = (
+                        st.session_state.get("mp_choice",
+                                             "➕ New template"))
+                    st.session_state["mp_notice"] = (
+                        f"“{new_tpl.name}” ki nayi generated values "
+                        "form mein bhar di gayi hain — review karke "
+                        "Lock karo.")
+                    st.warning(
+                        f"“{new_tpl.name}” naam ka template pehle se "
+                        "maujud hai — nayi generated values 🎬 Master "
+                        "Prompt tab ke form mein bhar di hain. Wahan "
+                        "review karke isi naam par Lock karo, ya naam "
+                        "badal kar Lock karo; tab tak purana template "
+                        "mehfooz hai.")
+                else:
+                    master_prompt.save(new_tpl)
+                    st.session_state["mp_choice"] = new_tpl.name
+                    st.session_state.pop("mp_loaded_for", None)
+                    st.success(
+                        f"🎬 Master prompt tayyar aur lock ho gaya: "
+                        f"“{new_tpl.name}” — "
+                        f"{len(new_tpl.characters)} characters, "
+                        f"{new_tpl.target_format}. Ab neeche step 2 "
+                        "mein isi se topic pack banao.")
+            except Exception as e:
+                friendly_error(e)
+
+    st.markdown("**2 — Topic generate karo**")
+    studio_templates = master_prompt.list_names()
+    if not studio_templates:
+        st.info("Abhi koi master prompt saved nahi hai — upar step 1 "
+                "se banao, ya 🎬 Master Prompt tab mein lock karo.")
+    else:
+        studio_tpl_name = st.selectbox("Master prompt",
+                                       studio_templates,
+                                       key="studio_mp_select")
+        col_st, col_sgb = st.columns([4, 1])
+        with col_st:
+            studio_topic = st.text_input(
+                "Topic", key="studio_mp_topic",
+                placeholder="e.g. Gus tries to cook a giant pancake")
+        with col_sgb:
+            st.write("")  # align the button with the input box
+            studio_gen_pack_clicked = st.button(
+                "🎬 Generate topic pack", key="studio_mp_gen_pack_btn")
+        if studio_gen_pack_clicked:
+            clean_topic = (studio_topic or "").strip()
+            if not clean_topic:
+                st.error("Pehle topic likho.")
+            else:
+                existing = next(
+                    (t for t in master_prompt.list_topics(
+                        studio_tpl_name)
+                     if t.topic.strip().lower()
+                     == clean_topic.lower()), None)
+                topic_row = existing or master_prompt.add_topic(
+                    studio_tpl_name, clean_topic)
+                try:
+                    with st.spinner("Locked template se production "
+                                    "pack ban raha hai…"):
+                        pack = generators.generate_topic_pack(
+                            master_prompt.load(studio_tpl_name),
+                            clean_topic)
+                    master_prompt.save_topic_result(topic_row.id, pack)
+                    st.success(
+                        f"🎬 Pack tayyar — “{clean_topic}” ke neeche "
+                        f"auto-save ho gaya (“{studio_tpl_name}”). "
+                        "Ye pack 🎬 Master Prompt tab mein bhi mehfooz "
+                        "hai.")
+                    _render_pack(pack, studio_tpl_name, clean_topic,
+                                 f"studio_{topic_row.id}")
                 except Exception as e:
                     friendly_error(e)
 
@@ -743,13 +914,15 @@ with tab_eval:
 # Tab 5 — Master Prompt (lock a template once; Step 2 generates by topic)
 # ---------------------------------------------------------------------------
 with tab_master:
-    from src import master_prompt
+    from src import generators, master_prompt
     from src.schemas import MasterPromptTemplate
 
     st.subheader("Master Prompt — lock your production template")
     st.caption("Set everything once — characters, style, structure and "
-               "posting defaults. After locking, the next step generates "
-               "a full video package from just a topic name.")
+               "posting defaults. Generation — niche se master prompt, "
+               "aur topic se poora pack — ✍️ Content Studio tab mein "
+               "hota hai; yahan templates lock hote hain aur saved "
+               "packs mehfooz rehte hain.")
 
     _notice = st.session_state.pop("mp_notice", None)
     if _notice:
@@ -758,6 +931,7 @@ with tab_master:
     NEW_TEMPLATE = "➕ New template"
     MP_FORMATS = ["Shorts 30s", "Reel 60s", "YouTube 3–5 min"]
     MP_LANGUAGES = ["English", "Urdu", "Roman Urdu"]
+
     template_names = master_prompt.list_names()
     if template_names:
         for _tname in template_names:
@@ -884,8 +1058,9 @@ with tab_master:
 
     # ------------------------------------------------------------------
     # Topics — the selected template's own section. A topic lives under
-    # exactly one template and is never mixed with another's. Step 2
-    # generation will auto-save its result onto the topic from here.
+    # exactly one template and is never mixed with another's. Packs are
+    # generated in the Content Studio tab and auto-save onto their
+    # topic; here they stay viewable, in order, under their template.
     # ------------------------------------------------------------------
     if choice != NEW_TEMPLATE:
         st.divider()
@@ -934,7 +1109,12 @@ with tab_master:
                       f"{(t.created_at or '')[:10]}")
             with st.expander(_label):
                 if t.result:
-                    st.json(t.result)
+                    if (isinstance(t.result, dict)
+                            and "beats" in t.result):
+                        _render_pack(t.result, choice, t.topic,
+                                     f"exp_{t.id}")
+                    else:
+                        st.json(t.result)
                 _cur = t.status if t.status in TOPIC_STATUS_LABELS else "new"
                 new_status = st.selectbox(
                     "Status", list(TOPIC_STATUS_LABELS),
