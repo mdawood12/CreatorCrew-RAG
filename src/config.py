@@ -10,6 +10,11 @@ Design notes (from the FINAL master prompt v2):
         stop or slow down. An app CANNOT regenerate a Gemini key by itself
         (that needs the owner's Google sign-in at AI Studio) — if the whole
         pool is down, the UI shows the 1-minute manual steps instead.
+- [C16] MODEL_CHAIN: the model-level twin of the key pool. A model error
+        (404/not found, 503/overloaded) advances to the next model in the
+        chain instead of stopping the app; key errors keep rotating keys
+        on the same model. LLM_MODELS overrides the chain; LLM_MODEL
+        remains the primary.
 - [C4]  No key is NOT a crash: the app runs in demo mode (RAG, memory,
         splitter and UI all work; only LLM buttons ask for a key).
 - [C3]  LangSmith tracing turns on only when LANGCHAIN_API_KEY is set.
@@ -66,6 +71,24 @@ except Exception:  # python-dotenv not installed yet — parse .env manually
 # to new users", so new keys must use a Gemini 3 flash model. Override with
 # the LLM_MODEL environment variable if Google rotates availability again.
 LLM_MODEL = os.getenv("LLM_MODEL", "gemini-3-flash-preview")
+
+
+def _parse_model_chain() -> list[str]:
+    """The ordered MODEL BACKUP CHAIN [C16] — the model-level twin of
+    the key pool: if LLM_MODELS is set, it wins (comma-separated);
+    otherwise the primary (LLM_MODEL) followed by the stable fallbacks.
+    Deduped, order preserved, never empty."""
+    raw = os.getenv("LLM_MODELS", "")
+    names = ([m.strip() for m in raw.split(",")] if raw.strip()
+             else [LLM_MODEL, "gemini-2.5-flash", "gemini-2.5-flash-lite"])
+    chain: list[str] = []
+    for name in names:
+        if name and name not in chain:
+            chain.append(name)
+    return chain or [LLM_MODEL]
+
+
+MODEL_CHAIN = _parse_model_chain()
 EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 CHUNK_SIZE = 1000
 CHUNK_OVERLAP = 150
@@ -236,9 +259,11 @@ class KeyManager:
 KEY_MANAGER = KeyManager()
 
 
-def get_llm(temperature: float = TEMP_SCRIPT):
+def get_llm(temperature: float = TEMP_SCRIPT, model: str | None = None):
     """LLM factory [C12/C15] — every agent gets its model through here,
-    so the provider and the key pool can change without touching agents."""
+    so the provider and the key pool can change without touching agents.
+    `model` overrides the primary (used by the backup chain [C16]);
+    the default is LLM_MODEL, exactly as before."""
     key = KEY_MANAGER.current_key()
     if not key:
         return None  # demo mode [C4]
@@ -246,35 +271,76 @@ def get_llm(temperature: float = TEMP_SCRIPT):
     # transport="rest": the default gRPC transport hangs behind HTTP proxies
     # (verified in sandbox testing); REST works through proxies everywhere.
     return ChatGoogleGenerativeAI(
-        model=LLM_MODEL, google_api_key=key, temperature=temperature,
-        transport="rest")
+        model=model or LLM_MODEL, google_api_key=key,
+        temperature=temperature, transport="rest")
+
+
+def _key_error_status(msg: str) -> int | None:
+    """Classify a failure message as a KEY problem [C15]: 429 (quota)
+    or 403 (invalid/revoked key). Same substring rules as always."""
+    if "429" in msg or "quota" in msg or "rate" in msg:
+        return 429
+    if "403" in msg or "api key" in msg or "permission" in msg:
+        return 403
+    return None
+
+
+def _is_model_error(msg: str) -> bool:
+    """True when the MODEL itself is the problem [C16]: it does not
+    exist for this API version (404 / not found), or the service is
+    down or overloaded (503 / unavailable). Rotating keys cannot fix
+    these — the backup chain advances to the next model instead."""
+    return any(s in msg for s in
+               ("404", "not found", "not_found", "503",
+                "unavailable", "overloaded"))
 
 
 def call_llm_with_failover(make_call, attempts: int = 3):
-    """Run make_call(llm); on quota/invalid errors, back off, switch keys
-    [C15] and retry. Raises the last error if the whole pool fails."""
+    """Run make_call(llm) with two layers of failover, so one failure
+    never stops the app:
+
+    - KEY errors (429 quota / 403 invalid) rotate the key pool [C15]
+      and retry the SAME model, up to `attempts` times per model.
+    - MODEL errors (404 / not found / 503 / overloaded) advance to the
+      next model in MODEL_CHAIN [C16] and retry with the same key.
+    - Any other error raises immediately, as before.
+
+    Total tries are bounded by len(MODEL_CHAIN) x attempts. If every
+    model fails, raises a RuntimeError carrying the recovery steps.
+    """
     import time
     last_err = None
-    for attempt in range(attempts):
-        llm = get_llm()
-        if llm is None:
-            raise RuntimeError("No API key configured (demo mode).")
-        try:
-            return make_call(llm)
-        except Exception as e:  # inspect for quota / auth problems
-            last_err = e
-            msg = str(e).lower()
-            status = (429 if ("429" in msg or "quota" in msg or "rate" in msg)
-                      else 403 if ("403" in msg or "api key" in msg
-                                   or "permission" in msg) else None)
-            if status is None:
+    models = list(MODEL_CHAIN) or [LLM_MODEL]
+    for model in models:
+        for attempt in range(attempts):
+            llm = get_llm(model=model)
+            if llm is None:
+                raise RuntimeError("No API key configured (demo mode).")
+            try:
+                return make_call(llm)
+            except Exception as e:  # inspect for key / model problems
+                last_err = e
+                msg = str(e).lower()
+                status = _key_error_status(msg)
+                if status is not None:
+                    logger.warning("LLM call failed (%s) on %s, attempt %s",
+                                   status, model, attempt + 1)
+                    if KEY_MANAGER.report_failure(status) is None:
+                        raise RuntimeError(
+                            "All API keys failed. "
+                            + KeyManager.REGENERATION_STEPS) from last_err
+                    time.sleep(2 * (attempt + 1))  # backoff before retry
+                    continue
+                if _is_model_error(msg):
+                    logger.warning("Model %s unavailable (%s) — "
+                                   "switching to the next model in the "
+                                   "chain", model, str(e)[:120])
+                    break  # next model, same key
                 raise
-            logger.warning("LLM call failed (%s), attempt %s", status, attempt + 1)
-            if KEY_MANAGER.report_failure(status) is None:
-                break
-            time.sleep(2 * (attempt + 1))  # backoff before retry
     raise RuntimeError(
-        "All API keys failed. " + KeyManager.REGENERATION_STEPS) from last_err
+        "All API keys failed (every model in the backup chain was "
+        f"tried: {', '.join(models)}). "
+        + KeyManager.REGENERATION_STEPS) from last_err
 
 
 # --------------------------------------------------------------------------
