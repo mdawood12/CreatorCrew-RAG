@@ -10,4 +10,5 @@ storage/*.log
 .pytest_cache/
 .DS_Store
 data/library/
+data/key_state.json
 outputs/shorts/_work/

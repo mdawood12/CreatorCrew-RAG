@@ -15,6 +15,10 @@ Design notes (from the FINAL master prompt v2):
         chain instead of stopping the app; key errors keep rotating keys
         on the same model. LLM_MODELS overrides the chain; LLM_MODEL
         remains the primary.
+- [C17] Key-pool memory: dead-key marks PERSIST across restarts in a
+        small JSON state file (fingerprints only — raw keys are never
+        written). A 429 (quota) mark revives after 24 h, when the daily
+        quota resets; a 403 (invalid/revoked) mark never expires.
 - [C4]  No key is NOT a crash: the app runs in demo mode (RAG, memory,
         splitter and UI all work; only LLM buttons ask for a key).
 - [C3]  LangSmith tracing turns on only when LANGCHAIN_API_KEY is set.
@@ -23,10 +27,12 @@ installed), so `config.validate()` works even before the full install.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
 import shutil
+import time
 import urllib.request
 import urllib.error
 from pathlib import Path
@@ -144,6 +150,29 @@ def mask(key: str) -> str:
 
 
 # --------------------------------------------------------------------------
+# [C17] Key-pool memory — persisted dead-key marks
+# --------------------------------------------------------------------------
+# A 429 is a DAILY-quota mark: the quota resets every 24 h, so the mark
+# revives after a day. A 403 means the key itself is invalid/revoked —
+# that never heals, so the mark does not expire.
+KEY_QUOTA_REVIVE_SECONDS = 24 * 60 * 60
+
+
+def _key_state_path() -> Path:
+    """Where dead-key marks live: KEY_STATE_PATH when set, else
+    data/key_state.json (git-ignored — runtime state, not source)."""
+    raw = os.getenv("KEY_STATE_PATH", "")
+    return Path(raw) if raw.strip() else DATA_DIR / "key_state.json"
+
+
+def _key_fingerprint(key: str) -> str:
+    """Non-reversible identity for a key (first 16 hex chars of its
+    sha256). The state file stores ONLY these — a raw API key is never
+    written to disk by the key manager."""
+    return hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
+
+
+# --------------------------------------------------------------------------
 # [C15] API Key Manager — pool, health check, automatic failover
 # --------------------------------------------------------------------------
 class KeyManager:
@@ -152,6 +181,7 @@ class KeyManager:
     - health_check(): one tiny free call to the Gemini models endpoint.
     - report_failure(status): on 429 (quota) or 403 (invalid/revoked),
       switch to the next key and return it (or None if the pool is down).
+    - Dead-key marks persist across restarts [C17] — see _load_state.
     - The manager NEVER creates/regenerates keys — that requires the
       owner's Google sign-in. REGENERATION_STEPS is what the UI shows
       when every key is down; recovery takes about one minute.
@@ -191,6 +221,92 @@ class KeyManager:
         self.keys = keys
         self.active = 0
         self.dead: set[int] = set()
+        # [C17] Restore persisted dead-key marks so a restart does not
+        # retry keys that already failed. Start on the first key that
+        # is not known-dead; if EVERY key is down, stay on the first —
+        # selection still hands out a key to try, exactly as a fresh
+        # manager would.
+        self._persisted: dict[str, dict] = self._load_state()
+        for i, key in enumerate(self.keys):
+            if _key_fingerprint(key) in self._persisted:
+                self.dead.add(i)
+        for i in range(len(self.keys)):
+            if i not in self.dead:
+                self.active = i
+                break
+
+    # -- persisted dead-key state [C17] ------------------------------------
+    @staticmethod
+    def _entry_expired(entry: dict, now: float) -> bool:
+        """Only 429 (quota) marks expire — after the daily reset."""
+        return (entry.get("status") == 429
+                and now - float(entry.get("failed_at", 0))
+                >= KEY_QUOTA_REVIVE_SECONDS)
+
+    def _load_state(self) -> dict[str, dict]:
+        """Read persisted dead-key marks, keyed by key fingerprint.
+
+        Missing or corrupt file -> clean start. Expired 429 marks are
+        pruned. This must NEVER raise: a broken state file cannot be
+        allowed to break the app.
+        """
+        try:
+            path = _key_state_path()
+            if not path.exists():
+                return {}
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as e:
+            logger.warning("Key state unreadable (%s) — starting clean", e)
+            return {}
+        if not isinstance(raw, dict):
+            return {}
+        now = time.time()
+        state: dict[str, dict] = {}
+        for fp, entry in raw.items():
+            if not isinstance(fp, str) or not isinstance(entry, dict):
+                continue
+            status = entry.get("status")
+            failed_at = entry.get("failed_at")
+            if status not in (429, 403):
+                continue
+            if isinstance(failed_at, bool) \
+                    or not isinstance(failed_at, (int, float)):
+                continue
+            entry = {"status": status, "failed_at": float(failed_at)}
+            if self._entry_expired(entry, now):
+                continue  # yesterday's quota mark — the key has revived
+            state[fp] = entry
+        return state
+
+    def _save_state(self) -> None:
+        """Persist dead-key marks (fingerprints only — never raw keys).
+        Best-effort: a failed write must never break failover."""
+        try:
+            path = _key_state_path()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.parent / (path.name + ".tmp")
+            tmp.write_text(json.dumps(self._persisted, indent=2),
+                           encoding="utf-8")
+            tmp.replace(path)
+        except Exception as e:
+            logger.warning("Could not persist key state: %s", e)
+
+    def _revive_expired(self) -> None:
+        """Revive 429 marks past the daily-quota window. Called on the
+        selection paths so a long-running app recovers too, not only
+        restarts."""
+        if not self._persisted:
+            return
+        now = time.time()
+        expired = {fp for fp, entry in self._persisted.items()
+                   if self._entry_expired(entry, now)}
+        if not expired:
+            return
+        for fp in expired:
+            del self._persisted[fp]
+        self.dead = {i for i in self.dead
+                     if _key_fingerprint(self.keys[i]) not in expired}
+        self._save_state()
 
     # -- basics ------------------------------------------------------------
     @property
@@ -198,8 +314,18 @@ class KeyManager:
         return len(self.keys) > 0
 
     def current_key(self) -> str | None:
+        self._revive_expired()
         if not self.has_keys or self.active >= len(self.keys):
             return None
+        if self.active in self.dead:
+            # The active key is known-dead — move to the first live
+            # one. If every key is down, fall through and hand out the
+            # current key anyway: a restart must never be worse than
+            # having no memory at all.
+            for i, _k in enumerate(self.keys):
+                if i not in self.dead:
+                    self.active = i
+                    break
         return self.keys[self.active]
 
     # -- health ------------------------------------------------------------
@@ -229,9 +355,16 @@ class KeyManager:
         """
         if not self.has_keys:
             return None
+        self._revive_expired()
         logger.warning("Key %s failed (status=%s) — switching to next key",
                        mask(self.keys[self.active]), status_code)
         self.dead.add(self.active)
+        if status_code in (429, 403):
+            # [C17] Remember the failure across restarts — fingerprint
+            # only, the raw key never touches the disk.
+            self._persisted[_key_fingerprint(self.keys[self.active])] = {
+                "status": status_code, "failed_at": time.time()}
+            self._save_state()
         for i, _k in enumerate(self.keys):
             if i not in self.dead:
                 self.active = i
